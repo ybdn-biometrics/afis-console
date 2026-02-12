@@ -1,4 +1,21 @@
-# afis-console
+# AFIS Console
 
-*Part of the YBDN Biometrics ecosystem.*
-Companion tool to NIST Studio for report import, analysis and export.
+Part of YBDN Biometrics.
+
+## Overview
+...
+
+## Features
+...
+
+## Input formats
+...
+
+## Output formats
+...
+
+## Roadmap
+...
+
+## Related Projects
+- NIST Studio
