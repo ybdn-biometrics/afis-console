@@ -2,6 +2,7 @@ import os
 import shutil
 import fitz  # PyMuPDF
 import re
+import unicodedata
 from datetime import datetime
 
 def has_no_homonyme(pdf_path: str) -> bool | None:
@@ -42,6 +43,138 @@ def has_no_homonyme(pdf_path: str) -> bool | None:
     except Exception as e:
         print(f"  ⚠ Erreur lecture {os.path.basename(pdf_path)}: {e}")
         return None
+
+def _normalize_name(name: str) -> str:
+    """
+    Normalise un nom pour comparaison :
+    - Supprime accents, tirets, apostrophes
+    - Passe en majuscule
+    - Supprime les espaces multiples
+    """
+    # Décomposer les caractères Unicode et supprimer les diacritiques
+    nfkd = unicodedata.normalize('NFKD', name)
+    without_accents = ''.join(c for c in nfkd if not unicodedata.combining(c))
+    # Supprimer tirets, apostrophes, caractères spéciaux
+    cleaned = re.sub(r"[\-''`]", ' ', without_accents)
+    # Majuscule, supprimer espaces multiples
+    cleaned = re.sub(r'\s+', ' ', cleaned).strip().upper()
+    return cleaned
+
+def extract_main_identity(pdf_path: str) -> str | None:
+    """
+    Extrait l'identité principale de la page 1 du PDF.
+    C'est le nom affiché après 'Recherches dactyloscopiques concernant :'.
+    Retourne le nom (str) ou None si non trouvé.
+    """
+    try:
+        doc = fitz.open(pdf_path)
+        if len(doc) == 0:
+            doc.close()
+            return None
+        page = doc[0]
+        text = page.get_text()
+        doc.close()
+
+        lines = text.split('\n')
+        for i, line in enumerate(lines):
+            if 'recherches dactyloscopiques concernant' in line.lower():
+                if i + 1 < len(lines):
+                    name = lines[i + 1].strip()
+                    if name and len(name) > 1:
+                        return name
+        return None
+    except Exception:
+        return None
+
+def extract_alias_names(pdf_path: str) -> list[str]:
+    """
+    Extrait les noms d'alias listés dans la SECTION / Identités,
+    après la phrase 'est connu(e) sous les identités suivantes :'.
+    Retourne une liste de noms (str).
+    """
+    try:
+        doc = fitz.open(pdf_path)
+        text = ''
+        for p in doc:
+            text += p.get_text()
+        doc.close()
+
+        lines = text.split('\n')
+        aliases = []
+        in_alias_section = False
+
+        for i, line in enumerate(lines):
+            stripped = line.strip()
+
+            # Début de la zone d'alias
+            if 'est connu(e) sous les identités suivantes' in stripped.lower():
+                in_alias_section = True
+                continue
+
+            # Fin de la zone d'alias
+            if in_alias_section and 'section / signalisations' in stripped.lower():
+                break
+            if in_alias_section and stripped.lower().startswith('nombre d') and 'homonymes' in stripped.lower():
+                # Ligne finale de résumé (hors alias individuels)
+                if 'indique' in text.split('\n')[min(i+1, len(lines)-1)].lower():
+                    break
+
+            if not in_alias_section:
+                continue
+
+            # Détecter les noms d'alias :
+            # - Tout en majuscule, pas de chiffres, pas un label technique
+            if (stripped
+                and stripped == stripped.upper()
+                and not any(c.isdigit() for c in stripped)
+                and len(stripped) > 2
+                and 'nombre' not in stripped.lower()
+                and 'signalisation' not in stripped.lower()
+                and 'section' not in stripped.lower()
+                and 'homonyme' not in stripped.lower()
+                and 'né(e)' not in stripped.lower()
+                and 'reproduction' not in stripped.lower()
+                and 'sae' not in stripped.lower()
+                and 'pays' not in stripped.lower()):
+                aliases.append(stripped)
+
+        return aliases
+    except Exception:
+        return []
+
+def check_identity_mismatch(pdf_path: str) -> dict:
+    """
+    Compare l'identité de la page 1 avec les alias de la section identités.
+    Retourne un dict:
+        {
+            'main_identity': str | None,
+            'aliases': list[str],
+            'has_mismatch': bool,      # True si l'identité n'est PAS dans les alias
+            'has_identity_section': bool
+        }
+    """
+    main_id = extract_main_identity(pdf_path)
+    aliases = extract_alias_names(pdf_path)
+
+    if not main_id or not aliases:
+        return {
+            'main_identity': main_id,
+            'aliases': aliases,
+            'has_mismatch': False,  # Pas de section = pas d'erreur état civil
+            'has_identity_section': len(aliases) > 0
+        }
+
+    main_norm = _normalize_name(main_id)
+    alias_norms = [_normalize_name(a) for a in aliases]
+
+    has_mismatch = main_norm not in alias_norms
+
+    return {
+        'main_identity': main_id,
+        'aliases': aliases,
+        'has_mismatch': has_mismatch,
+        'has_identity_section': True
+    }
 
 def extract_identities_details(pdf_path: str) -> list:
     """
@@ -136,9 +269,11 @@ def generate_html_report(destination_dir, stats, file_details):
             .status-ok {{ color: green; font-weight: bold; }}
             .status-warning {{ color: orange; font-weight: bold; }}
             .status-error {{ color: red; font-weight: bold; }}
+            .status-identity {{ color: #8e44ad; font-weight: bold; }}
             .alias-list {{ margin: 0; padding-left: 20px; font-size: 0.9em; }}
             .badge-homonym {{ background-color: #e74c3c; color: white; padding: 2px 6px; border-radius: 4px; font-size: 0.8em; }}
             .badge-clean {{ background-color: #27ae60; color: white; padding: 2px 6px; border-radius: 4px; font-size: 0.8em; }}
+            .badge-mismatch {{ background-color: #8e44ad; color: white; padding: 2px 6px; border-radius: 4px; font-size: 0.8em; }}
         </style>
     </head>
     <body>
@@ -150,9 +285,10 @@ def generate_html_report(destination_dir, stats, file_details):
 
         <h2>1. Rapport général du traitement</h2>
         <div class="summary-box">
-            <p><strong>Total analysé :</strong> {stats['ok'] + stats['manual'] + stats['error']}</p>
+            <p><strong>Total analysé :</strong> {stats['ok'] + stats['manual'] + stats['error'] + stats['identity_error']}</p>
             <p><span class="status-ok">✔ Pas d'homonyme :</span> {stats['ok']}</p>
             <p><span class="status-warning">⚠ Homonymes détectés :</span> {stats['manual']}</p>
+            <p><span class="status-identity">🔴 Erreur état civil :</span> {stats['identity_error']}</p>
             <p><span class="status-error">✖ Erreurs de lecture :</span> {stats['error']}</p>
         </div>
 
@@ -162,6 +298,7 @@ def generate_html_report(destination_dir, stats, file_details):
                 <tr>
                     <th>Fichier</th>
                     <th>Page 1 (Homonyme)</th>
+                    <th>Identité / Alias</th>
                     <th>Détails des Alias (Section Identités)</th>
                     <th>Statut Final</th>
                 </tr>
@@ -194,11 +331,27 @@ def generate_html_report(destination_dir, stats, file_details):
                 
                 alias_html += f"<li>{identity['alias']} : {badge}</li>"
         alias_html += "</ul>"
+
+        # Colonne Identité / Alias
+        identity_html = ""
+        id_info = detail.get('identity_check', {})
+        main_id = id_info.get('main_identity', None)
+        if main_id:
+            identity_html += f"<strong>Page 1 :</strong> {main_id}<br>"
+            if id_info.get('has_mismatch', False):
+                identity_html += "<span class='badge-mismatch'>⚠ Non trouvé dans les alias</span>"
+            elif id_info.get('has_identity_section', False):
+                identity_html += "<span class='badge-clean'>✔ Présent dans les alias</span>"
+        else:
+            identity_html = "<em>N/A</em>"
         
         # Statut Final
         final_class = ""
         final_text = ""
-        if detail['is_manual']:
+        if detail.get('is_identity_error', False):
+             final_class = "status-identity"
+             final_text = "Erreur état civil"
+        elif detail['is_manual']:
              final_class = "status-warning"
              final_text = "À vérifier"
         elif detail['p1_clean'] is None:
@@ -212,6 +365,7 @@ def generate_html_report(destination_dir, stats, file_details):
             <tr>
                 <td>{filename}</td>
                 <td>{p1_status}</td>
+                <td>{identity_html}</td>
                 <td>{alias_html}</td>
                 <td class="{final_class}">{final_text}</td>
             </tr>
@@ -261,8 +415,10 @@ def process_folder(source_dir: str, log_callback=None, destination_dir: str = No
     # Créer les dossiers de destination
     dir_ok = os.path.join(base_dest, "Pas_d_homonyme")
     dir_manual = os.path.join(base_dest, "Homonymes_detectes")
+    dir_identity_error = os.path.join(base_dest, "Erreur_Etat_civil")
     os.makedirs(dir_ok, exist_ok=True)
     os.makedirs(dir_manual, exist_ok=True)
+    os.makedirs(dir_identity_error, exist_ok=True)
 
     # Lister les PDFs
     pdfs = [f for f in os.listdir(source_dir)
@@ -276,7 +432,7 @@ def process_folder(source_dir: str, log_callback=None, destination_dir: str = No
     if destination_dir:
         log_callback(f"↪️  Destination : '{destination_dir}'\n")
 
-    stats = {"ok": 0, "manual": 0, "error": 0}
+    stats = {"ok": 0, "manual": 0, "error": 0, "identity_error": 0}
     file_details = []
 
     for filename in sorted(pdfs):
@@ -291,9 +447,13 @@ def process_folder(source_dir: str, log_callback=None, destination_dir: str = No
         # Logique 2 : Y a-t-il un homonyme dans les identités ?
         homonym_in_identities = any(i['count'] > 0 for i in identities)
 
+        # Logique 3 : Vérification identité page 1 vs alias
+        identity_check = check_identity_mismatch(filepath)
+
         destination_dir_final = dir_manual
         message = ""
         is_manual = False
+        is_identity_error = False
 
         if res_p1 is None:
             # Erreur technique sur la lecture page 1
@@ -301,6 +461,12 @@ def process_folder(source_dir: str, log_callback=None, destination_dir: str = No
             message = "⚠️  (erreur lecture)"
             stats["error"] += 1
             is_manual = True 
+        elif identity_check['has_mismatch']:
+            # Identité page 1 absente des alias → erreur état civil
+            destination_dir_final = dir_identity_error
+            message = "🔴 (erreur état civil)"
+            stats["identity_error"] += 1
+            is_identity_error = True
         elif res_p1 is False: # Page 1 dit "Homonyme" (ou pas "non")
             destination_dir_final = dir_manual
             message = "🔶 (detecté par page 1)"
@@ -323,7 +489,9 @@ def process_folder(source_dir: str, log_callback=None, destination_dir: str = No
             'filename': filename,
             'p1_clean': res_p1, # True if "Non", False if homonym detected
             'identities': identities,
-            'is_manual': is_manual
+            'is_manual': is_manual,
+            'is_identity_error': is_identity_error,
+            'identity_check': identity_check
         })
 
         try:
@@ -341,6 +509,7 @@ def process_folder(source_dir: str, log_callback=None, destination_dir: str = No
     log_callback(f"📊 Résultat :")
     log_callback(f"   ✅ Pas d'homonyme     : {stats['ok']}")
     log_callback(f"   🔶 Homonymes détectés : {stats['manual']}")
+    log_callback(f"   🔴 Erreur état civil  : {stats['identity_error']}")
     log_callback(f"   ⚠️  Erreurs            : {stats['error']}")
     log_callback(f"{'='*50}")
     
