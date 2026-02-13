@@ -2,6 +2,7 @@ import os
 import shutil
 import fitz  # PyMuPDF
 import re
+from datetime import datetime
 
 def has_no_homonyme(pdf_path: str) -> bool | None:
     """
@@ -42,45 +43,197 @@ def has_no_homonyme(pdf_path: str) -> bool | None:
         print(f"  ⚠ Erreur lecture {os.path.basename(pdf_path)}: {e}")
         return None
 
-def check_homonym_counts(pdf_path: str) -> bool:
+def extract_identities_details(pdf_path: str) -> list:
     """
-    Retourne True si le document contient "Section/identités" ET qu'au moins
-    une ligne "- nombre d'homonymes" contient une valeur > 0.
+    Extrait les détails des identités/alias et leur nombre d'homonymes.
+    Retourne une liste de dicts: [{'alias': 'NOM PRENOM', 'count': 0}, ...]
     """
     try:
         doc = fitz.open(pdf_path)
-        full_text = ""
+        text = ""
         for page in doc:
-            full_text += page.get_text()
+            text += page.get_text()
         doc.close()
-
-        # Normalisation pour verification
-        lower_text = full_text.lower()
-
-        # Si pas de section identités, on ignore cette vérification (donc pas de détection d'homonyme par cette méthode)
-        if "section / identités" not in lower_text and "section/identités" not in lower_text:
-            return False
-
-        # Regex pour capturer la valeur après "nombre d'homonymes"
-        # Supporte :
-        # - nombre d'homonymes : 0
-        # - nombre d'homonymes :\n0
-        # - nombre d'homonymes 0
-        pattern = r"nombre\s+d[’']homonymes\s*[:\s]\s*(\d+)"
-        matches = re.finditer(pattern, lower_text)
-
-        for match in matches:
-            try:
-                val = int(match.group(1))
-                if val > 0:
-                    return True
-            except ValueError:
-                continue
         
-        return False
+        text_lower = text.lower()
+        
+        # Regex pour capturer la valeur après "nombre d'homonymes"
+        pattern_count = r"nombre\s+d[’']homonymes\s*[:\s]\s*(\d+)"
+        matches = list(re.finditer(pattern_count, text_lower))
+        
+        identities = []
+        last_pos = 0
+        
+        for m in matches:
+            count = int(m.group(1))
+            start_pos = m.start()
+            
+            # Chercher "né(e) le" avant cette occurrence pour délimiter le bloc
+            subtext = text_lower[last_pos:start_pos]
+            ne_le_matches = list(re.finditer(r"né\(e\)\s+le", subtext))
+            
+            alias_name = "Non identifié"
+            if ne_le_matches:
+                block_start_rel = ne_le_matches[-1].start()
+                block_start_abs = last_pos + block_start_rel
+                
+                # Extraire le morceau de texte entre "né(e) le" et le compteur
+                chunk = text[block_start_abs:start_pos]
+                lines_in_chunk = chunk.split('\n')
+                # Nettoyage des lignes vides
+                lines_in_chunk = [l.strip() for l in lines_in_chunk if l.strip()]
+                
+                # Heuristique : Ligne 0 = "Né(e) le ...", Ligne 1 = NOM PRENOM
+                if len(lines_in_chunk) > 1:
+                    possible_name = lines_in_chunk[1]
+                    # Petit filtre pour éviter de prendre des labels techniques
+                    if "signalisation" not in possible_name.lower() and len(possible_name) > 2:
+                         alias_name = possible_name
+            
+            identities.append({
+                'alias': alias_name,
+                'count': count
+            })
+            
+            last_pos = start_pos + len(m.group(0))
+
+        return identities
     except Exception as e:
-        print(f"  ⚠ Erreur lecture (check identités) {os.path.basename(pdf_path)}: {e}")
-        return False
+        print(f"  ⚠ Erreur extraction identités {os.path.basename(pdf_path)}: {e}")
+        return []
+
+def check_homonym_counts(pdf_path: str) -> bool:
+    """
+    Retourne True si 'Section/identités' est présente ET qu'au moins 
+    une ligne 'nombre d'homonymes' > 0.
+    Utilise extract_identities_details en interne.
+    """
+    identities = extract_identities_details(pdf_path)
+    # On vérifie aussi la présence de la section textuelle pour être cohérent avec l'ancienne logique
+    # Mais ici, si on a trouvé des identités avec un count > 0, c'est qu'il y a homonyme.
+    for identity in identities:
+        if identity['count'] > 0:
+            return True
+    return False
+
+def generate_html_report(destination_dir, stats, file_details):
+    timestamp = datetime.now().strftime("%d/%m/%Y à %H:%M:%S")
+    
+    html_content = f"""
+    <html>
+    <head>
+        <title>Recherche d'homonymes - Rapport</title>
+        <style>
+            body {{ font-family: sans-serif; margin: 20px; }}
+            h1 {{ color: #2c3e50; }}
+            h2 {{ color: #34495e; margin-top: 30px; }}
+            .metadata {{ color: #7f8c8d; font-style: italic; margin-bottom: 20px; }}
+            .summary-box {{ background: #ecf0f1; padding: 15px; border-radius: 5px; margin-bottom: 20px; }}
+            table {{ border-collapse: collapse; width: 100%; margin-top: 10px; }}
+            th, td {{ border: 1px solid #bdc3c7; padding: 8px; text-align: left; }}
+            th {{ background-color: #34495e; color: white; }}
+            tr:nth-child(even) {{ background-color: #f2f2f2; }}
+            .status-ok {{ color: green; font-weight: bold; }}
+            .status-warning {{ color: orange; font-weight: bold; }}
+            .status-error {{ color: red; font-weight: bold; }}
+            .alias-list {{ margin: 0; padding-left: 20px; font-size: 0.9em; }}
+            .badge-homonym {{ background-color: #e74c3c; color: white; padding: 2px 6px; border-radius: 4px; font-size: 0.8em; }}
+            .badge-clean {{ background-color: #27ae60; color: white; padding: 2px 6px; border-radius: 4px; font-size: 0.8em; }}
+        </style>
+    </head>
+    <body>
+        <h1>Recherche d'homonymes</h1>
+        <div class="metadata">
+            <strong>DFAED - Rapports de signalisation</strong><br>
+            Traitement effectué le {timestamp}
+        </div>
+
+        <h2>1. Rapport général du traitement</h2>
+        <div class="summary-box">
+            <p><strong>Total analysé :</strong> {stats['ok'] + stats['manual'] + stats['error']}</p>
+            <p><span class="status-ok">✔ Pas d'homonyme :</span> {stats['ok']}</p>
+            <p><span class="status-warning">⚠ Homonymes détectés :</span> {stats['manual']}</p>
+            <p><span class="status-error">✖ Erreurs de lecture :</span> {stats['error']}</p>
+        </div>
+
+        <h2>2. Détails par fichier analysé</h2>
+        <table>
+            <thead>
+                <tr>
+                    <th>Fichier</th>
+                    <th>Page 1 (Homonyme)</th>
+                    <th>Détails des Alias (Section Identités)</th>
+                    <th>Statut Final</th>
+                </tr>
+            </thead>
+            <tbody>
+    """
+
+    for detail in file_details:
+        filename = detail['filename']
+        # Statut Page 1
+        p1_status = ""
+        if detail['p1_clean'] is None: p1_status = "Erreur"
+        elif detail['p1_clean'] is True: p1_status = "Non (Clean)"
+        else: p1_status = "OUI (Detecté)"
+
+        # Liste alias
+        alias_html = "<ul class='alias-list'>"
+        has_alias_homonym = False
+        if not detail['identities']:
+             alias_html += "<li><em>Aucune section identité détectée</em></li>"
+        else:
+            for identity in detail['identities']:
+                count = identity['count']
+                badge = ""
+                if count > 0:
+                    badge = f"<span class='badge-homonym'>{count} homonyme(s)</span>"
+                    has_alias_homonym = True
+                else:
+                    badge = "<span class='badge-clean'>0</span>"
+                
+                alias_html += f"<li>{identity['alias']} : {badge}</li>"
+        alias_html += "</ul>"
+        
+        # Statut Final
+        final_class = ""
+        final_text = ""
+        if detail['is_manual']:
+             final_class = "status-warning"
+             final_text = "À vérifier"
+        elif detail['p1_clean'] is None:
+             final_class = "status-error"
+             final_text = "Erreur"
+        else:
+             final_class = "status-ok"
+             final_text = "OK"
+
+        html_content += f"""
+            <tr>
+                <td>{filename}</td>
+                <td>{p1_status}</td>
+                <td>{alias_html}</td>
+                <td class="{final_class}">{final_text}</td>
+            </tr>
+        """
+
+    html_content += """
+            </tbody>
+        </table>
+    </body>
+    </html>
+    """
+
+    timestamp_filename = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+    report_filename = f"rapport_traitement_{timestamp_filename}.html"
+    report_path = os.path.join(destination_dir, report_filename)
+    try:
+        with open(report_path, "w", encoding="utf-8") as f:
+            f.write(html_content)
+        return report_path
+    except Exception as e:
+        print(f"Erreur écriture rapport HTML: {e}")
+        return None
 
 def process_folder(source_dir: str, log_callback=None, destination_dir: str = None):
     """
@@ -124,6 +277,7 @@ def process_folder(source_dir: str, log_callback=None, destination_dir: str = No
         log_callback(f"↪️  Destination : '{destination_dir}'\n")
 
     stats = {"ok": 0, "manual": 0, "error": 0}
+    file_details = []
 
     for filename in sorted(pdfs):
         filepath = os.path.join(source_dir, filename)
@@ -131,8 +285,11 @@ def process_folder(source_dir: str, log_callback=None, destination_dir: str = No
         # Logique 1 : Page 1 "Homonymes ... non"
         res_p1 = has_no_homonyme(filepath)
         
-        # Logique 2 : Section identités, count > 0
-        res_ident = check_homonym_counts(filepath)
+        # Extraction détaillée pour le rapport et Logique 2
+        identities = extract_identities_details(filepath)
+        
+        # Logique 2 : Y a-t-il un homonyme dans les identités ?
+        homonym_in_identities = any(i['count'] > 0 for i in identities)
 
         destination_dir_final = dir_manual
         message = ""
@@ -143,15 +300,13 @@ def process_folder(source_dir: str, log_callback=None, destination_dir: str = No
             destination_dir_final = dir_manual
             message = "⚠️  (erreur lecture)"
             stats["error"] += 1
-            is_manual = True # On considère erreur comme manuel pour le déplacement
-        elif res_p1 is False:
-            # Detecté par logique 1
+            is_manual = True 
+        elif res_p1 is False: # Page 1 dit "Homonyme" (ou pas "non")
             destination_dir_final = dir_manual
             message = "🔶 (detecté par page 1)"
             stats["manual"] += 1
             is_manual = True
-        elif res_ident is True:
-            # Detecté par logique 2 (valeur > 0 dans section identités)
+        elif homonym_in_identities:
             destination_dir_final = dir_manual
             message = "🔶 (detecté par section identités)"
             stats["manual"] += 1
@@ -163,11 +318,24 @@ def process_folder(source_dir: str, log_callback=None, destination_dir: str = No
             stats["ok"] += 1
             is_manual = False
 
+        # Store details for report
+        file_details.append({
+            'filename': filename,
+            'p1_clean': res_p1, # True if "Non", False if homonym detected
+            'identities': identities,
+            'is_manual': is_manual
+        })
+
         try:
             shutil.move(filepath, os.path.join(destination_dir_final, filename))
             log_callback(f"{message} {filename} → {os.path.basename(destination_dir_final)}/")
         except Exception as e:
             log_callback(f"❌ Erreur déplacement {filename}: {e}")
+
+    # Generate HTML Report
+    report_file = generate_html_report(base_dest, stats, file_details)
+    if report_file:
+         log_callback(f"\n📄 Rapport HTML généré : {os.path.basename(report_file)}")
 
     log_callback(f"\n{'='*50}")
     log_callback(f"📊 Résultat :")
