@@ -29,6 +29,29 @@ elif platform.system() == "Linux":
 else:
     app_name_with_suffix = app_name
 
+# --- Icon handling ---
+# Windows requires .ico format; Linux/macOS can use .png
+icon_source = os.path.abspath("src/afis_console/assets/app_icon.png")
+icon_arg = None
+
+if os.path.exists(icon_source):
+    if platform.system() == "Windows":
+        # Convert .png to .ico using Pillow (installed as build dependency)
+        ico_path = os.path.abspath("src/afis_console/assets/app_icon.ico")
+        try:
+            from PIL import Image
+            img = Image.open(icon_source)
+            # Create .ico with multiple sizes for best Windows rendering
+            img.save(ico_path, format='ICO', sizes=[(256, 256), (128, 128), (64, 64), (48, 48), (32, 32), (16, 16)])
+            icon_arg = f'--icon={ico_path}'
+            print(f"✅ Converted icon to .ico: {ico_path}")
+        except Exception as e:
+            print(f"⚠️ Could not convert icon to .ico: {e}. Building without icon.")
+    else:
+        icon_arg = f'--icon={icon_source}'
+else:
+    print(f"⚠️ Icon not found at {icon_source}. Building without icon.")
+
 # PyInstaller arguments
 args = [
     'src/afis_console/main.py',
@@ -40,8 +63,13 @@ args = [
     '--paths=src',
     '--clean',
     '--log-level=INFO',
-    '--icon=src/afis_console/assets/app_icon.png',  # Add icon
+    '--hidden-import=fitz',
+    '--hidden-import=pymupdf',
 ]
+
+# Add icon if available
+if icon_arg:
+    args.append(icon_arg)
 
 # Run PyInstaller
 try:

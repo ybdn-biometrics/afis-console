@@ -86,12 +86,17 @@ def extract_main_identity(pdf_path: str) -> str | None:
     except Exception:
         return None
 
-def extract_alias_names(pdf_path: str) -> list[str]:
+def _extract_section_identities(pdf_path: str) -> dict:
     """
-    Extrait les noms d'alias listés dans la SECTION / Identités,
-    après la phrase 'est connu(e) sous les identités suivantes :'.
-    Retourne une liste de noms (str).
+    Parse la SECTION / Identités du rapport PDF.
+    Retourne un dict:
+        {
+            'section_identity': str | None,
+            'section_dob': str | None,
+            'aliases': list[dict],  # [{'name': str, 'dob': str, 'signalisations': int}, ...]
+        }
     """
+    result = {'section_identity': None, 'section_dob': None, 'aliases': []}
     try:
         doc = fitz.open(pdf_path)
         text = ''
@@ -100,79 +105,168 @@ def extract_alias_names(pdf_path: str) -> list[str]:
         doc.close()
 
         lines = text.split('\n')
-        aliases = []
-        in_alias_section = False
 
+        # 1. Trouver "SECTION / Identités"
+        section_idx = None
         for i, line in enumerate(lines):
-            stripped = line.strip()
-
-            # Début de la zone d'alias
-            if 'est connu(e) sous les identités suivantes' in stripped.lower():
-                in_alias_section = True
-                continue
-
-            # Fin de la zone d'alias
-            if in_alias_section and 'section / signalisations' in stripped.lower():
+            if line.strip() == 'SECTION / Identités':
+                section_idx = i
                 break
-            if in_alias_section and stripped.lower().startswith('nombre d') and 'homonymes' in stripped.lower():
-                # Ligne finale de résumé (hors alias individuels)
-                if 'indique' in text.split('\n')[min(i+1, len(lines)-1)].lower():
+
+        if section_idx is None:
+            return result
+
+        # 2. Identité du header
+        if section_idx + 1 < len(lines):
+            result['section_identity'] = lines[section_idx + 1].strip()
+        if section_idx + 2 < len(lines):
+            m = re.search(r'né\(e\)\s+le\s+(\d{2}/\d{2}/\d{4})', lines[section_idx + 2])
+            if m:
+                result['section_dob'] = m.group(1)
+
+        # 3. Trouver "est connu(e) sous les identités suivantes :"
+        alias_start = None
+        for i in range(section_idx, len(lines)):
+            if 'est connu(e) sous les identités suivantes' in lines[i].lower():
+                alias_start = i
+                break
+
+        if alias_start is None:
+            return result
+
+        # 4. Parser les alias : "né(e) le" → NOM → nombre (signalisations) → homonymes
+        i = alias_start + 1
+        while i < len(lines):
+            stripped = lines[i].strip()
+
+            # Fin de la section
+            if 'section / signalisations' in stripped.lower():
+                break
+            if stripped.startswith('Nombre d') and 'homonymes' in stripped.lower():
+                if i + 1 < len(lines) and 'indique' in lines[i + 1].lower():
                     break
 
-            if not in_alias_section:
-                continue
+            # Chercher "né(e) le DD/MM/YYYY"
+            m = re.search(r'né\(e\)\s+le\s+(\d{2}/\d{2}/\d{4})', stripped)
+            if m:
+                alias_dob = m.group(1)
+                # Ligne suivante = NOM
+                if i + 1 < len(lines):
+                    alias_name = lines[i + 1].strip()
+                    if (alias_name
+                        and alias_name == alias_name.upper()
+                        and not any(c.isdigit() for c in alias_name)
+                        and len(alias_name) > 2
+                        and 'nombre' not in alias_name.lower()
+                        and 'signalisation' not in alias_name.lower()):
+                        
+                        # Ligne suivante du nom = nombre de signalisations (chiffre)
+                        signa_count = 0
+                        if i + 2 < len(lines):
+                            try:
+                                signa_count = int(lines[i + 2].strip())
+                            except ValueError:
+                                signa_count = 0
+                        
+                        result['aliases'].append({
+                            'name': alias_name,
+                            'dob': alias_dob,
+                            'signalisations': signa_count
+                        })
+                        i += 3  # Skip: né(e), NOM, nombre
+                        continue
+            i += 1
 
-            # Détecter les noms d'alias :
-            # - Tout en majuscule, pas de chiffres, pas un label technique
-            if (stripped
-                and stripped == stripped.upper()
-                and not any(c.isdigit() for c in stripped)
-                and len(stripped) > 2
-                and 'nombre' not in stripped.lower()
-                and 'signalisation' not in stripped.lower()
-                and 'section' not in stripped.lower()
-                and 'homonyme' not in stripped.lower()
-                and 'né(e)' not in stripped.lower()
-                and 'reproduction' not in stripped.lower()
-                and 'sae' not in stripped.lower()
-                and 'pays' not in stripped.lower()):
-                aliases.append(stripped)
-
-        return aliases
+        return result
     except Exception:
-        return []
+        return result
+
+def extract_alias_names(pdf_path: str) -> list[str]:
+    """
+    Extrait les noms d'alias listés dans la SECTION / Identités.
+    Retourne une liste de noms (str).
+    """
+    data = _extract_section_identities(pdf_path)
+    return [a['name'] for a in data['aliases']]
 
 def check_identity_mismatch(pdf_path: str) -> dict:
     """
-    Compare l'identité de la page 1 avec les alias de la section identités.
-    Retourne un dict:
-        {
-            'main_identity': str | None,
-            'aliases': list[str],
-            'has_mismatch': bool,      # True si l'identité n'est PAS dans les alias
-            'has_identity_section': bool
-        }
+    Compare la première identité de la SECTION / Identités avec les alias.
+    
+    Règle : La signalisation en cours génère automatiquement un alias avec le
+    même nom et 1 signalisation. Cet alias "auto-généré" est exclu de la 
+    comparaison (même nom normalisé que l'identité section + 1 signalisation).
+    
+    Parmi les alias restants, si la première identité n'apparaît dans aucun
+    alias → erreur d'état civil.
+    
+    Si après exclusion il ne reste aucun alias → pas d'erreur (pas de passif).
     """
     main_id = extract_main_identity(pdf_path)
-    aliases = extract_alias_names(pdf_path)
+    section_data = _extract_section_identities(pdf_path)
 
-    if not main_id or not aliases:
+    section_id = section_data['section_identity']
+    all_aliases = section_data['aliases']
+
+    if not section_id or not all_aliases:
         return {
             'main_identity': main_id,
-            'aliases': aliases,
-            'has_mismatch': False,  # Pas de section = pas d'erreur état civil
-            'has_identity_section': len(aliases) > 0
+            'section_identity': section_id,
+            'aliases': [a['name'] for a in all_aliases],
+            'has_mismatch': False,
+            'has_identity_section': len(all_aliases) > 0
         }
 
-    main_norm = _normalize_name(main_id)
-    alias_norms = [_normalize_name(a) for a in aliases]
+    section_norm = _normalize_name(section_id)
+    section_dob = section_data['section_dob']
 
-    has_mismatch = main_norm not in alias_norms
+    # Filtrer : exclure l'alias auto-généré par la signalisation en cours
+    # (même nom + même date de naissance + exactement 1 signalisation)
+    filtered_aliases = []
+    auto_excluded = False
+    for a in all_aliases:
+        if (not auto_excluded
+            and _normalize_name(a['name']) == section_norm
+            and a['dob'] == section_dob
+            and a['signalisations'] == 1):
+            auto_excluded = True
+            continue
+        filtered_aliases.append(a)
+
+    # S'il ne reste aucun alias après filtrage → pas d'erreur (personne sans passif)
+    if not filtered_aliases:
+        return {
+            'main_identity': main_id,
+            'section_identity': section_id,
+            'aliases': [a['name'] for a in all_aliases],
+            'has_mismatch': False,
+            'has_identity_section': True
+        }
+
+    # Vérifier si l'identité section (nom + date de naissance) apparaît dans les alias restants
+    has_mismatch = not any(
+        _normalize_name(a['name']) == section_norm and a['dob'] == section_dob
+        for a in filtered_aliases
+    )
+
+    # Classifier le type de mismatch
+    mismatch_type = 'none'
+    if has_mismatch:
+        # Vérifier si la différence est uniquement due aux espaces
+        section_nospace = section_norm.replace(' ', '')
+        space_match = any(
+            _normalize_name(a['name']).replace(' ', '') == section_nospace
+            and a['dob'] == section_dob
+            for a in filtered_aliases
+        )
+        mismatch_type = 'space_only' if space_match else 'real'
 
     return {
         'main_identity': main_id,
-        'aliases': aliases,
+        'section_identity': section_id,
+        'aliases': [a['name'] for a in all_aliases],
         'has_mismatch': has_mismatch,
+        'mismatch_type': mismatch_type,  # 'none', 'space_only', 'real'
         'has_identity_section': True
     }
 
@@ -285,10 +379,11 @@ def generate_html_report(destination_dir, stats, file_details):
 
         <h2>1. Rapport général du traitement</h2>
         <div class="summary-box">
-            <p><strong>Total analysé :</strong> {stats['ok'] + stats['manual'] + stats['error'] + stats['identity_error']}</p>
+            <p><strong>Total analysé :</strong> {stats['ok'] + stats['manual'] + stats['error'] + stats['identity_error'] + stats['identity_error_space']}</p>
             <p><span class="status-ok">✔ Pas d'homonyme :</span> {stats['ok']}</p>
             <p><span class="status-warning">⚠ Homonymes détectés :</span> {stats['manual']}</p>
             <p><span class="status-identity">🔴 Erreur état civil :</span> {stats['identity_error']}</p>
+            <p><span class="status-identity">🟣 Erreur espaces état civil :</span> {stats['identity_error_space']}</p>
             <p><span class="status-error">✖ Erreurs de lecture :</span> {stats['error']}</p>
         </div>
 
@@ -335,9 +430,9 @@ def generate_html_report(destination_dir, stats, file_details):
         # Colonne Identité / Alias
         identity_html = ""
         id_info = detail.get('identity_check', {})
-        main_id = id_info.get('main_identity', None)
-        if main_id:
-            identity_html += f"<strong>Page 1 :</strong> {main_id}<br>"
+        section_id = id_info.get('section_identity', None) or id_info.get('main_identity', None)
+        if section_id:
+            identity_html += f"<strong>Identité :</strong> {section_id}<br>"
             if id_info.get('has_mismatch', False):
                 identity_html += "<span class='badge-mismatch'>⚠ Non trouvé dans les alias</span>"
             elif id_info.get('has_identity_section', False):
@@ -348,7 +443,10 @@ def generate_html_report(destination_dir, stats, file_details):
         # Statut Final
         final_class = ""
         final_text = ""
-        if detail.get('is_identity_error', False):
+        if detail.get('is_identity_space', False):
+             final_class = "status-identity"
+             final_text = "Erreur espaces état civil"
+        elif detail.get('is_identity_error', False):
              final_class = "status-identity"
              final_text = "Erreur état civil"
         elif detail['is_manual']:
@@ -416,9 +514,11 @@ def process_folder(source_dir: str, log_callback=None, destination_dir: str = No
     dir_ok = os.path.join(base_dest, "Pas_d_homonyme")
     dir_manual = os.path.join(base_dest, "Homonymes_detectes")
     dir_identity_error = os.path.join(base_dest, "Erreur_Etat_civil")
+    dir_identity_space = os.path.join(dir_identity_error, "Espaces_inseres")
     os.makedirs(dir_ok, exist_ok=True)
     os.makedirs(dir_manual, exist_ok=True)
     os.makedirs(dir_identity_error, exist_ok=True)
+    os.makedirs(dir_identity_space, exist_ok=True)
 
     # Lister les PDFs
     pdfs = [f for f in os.listdir(source_dir)
@@ -432,7 +532,7 @@ def process_folder(source_dir: str, log_callback=None, destination_dir: str = No
     if destination_dir:
         log_callback(f"↪️  Destination : '{destination_dir}'\n")
 
-    stats = {"ok": 0, "manual": 0, "error": 0, "identity_error": 0}
+    stats = {"ok": 0, "manual": 0, "error": 0, "identity_error": 0, "identity_error_space": 0}
     file_details = []
 
     for filename in sorted(pdfs):
@@ -454,6 +554,7 @@ def process_folder(source_dir: str, log_callback=None, destination_dir: str = No
         message = ""
         is_manual = False
         is_identity_error = False
+        is_identity_space = False
 
         if res_p1 is None:
             # Erreur technique sur la lecture page 1
@@ -461,8 +562,15 @@ def process_folder(source_dir: str, log_callback=None, destination_dir: str = No
             message = "⚠️  (erreur lecture)"
             stats["error"] += 1
             is_manual = True 
+        elif identity_check['has_mismatch'] and identity_check.get('mismatch_type') == 'space_only':
+            # Différence uniquement due aux espaces → sous-dossier dédié
+            destination_dir_final = dir_identity_space
+            message = "🟣 (erreur espaces état civil)"
+            stats["identity_error_space"] += 1
+            is_identity_error = True
+            is_identity_space = True
         elif identity_check['has_mismatch']:
-            # Identité page 1 absente des alias → erreur état civil
+            # Identité absente des alias → erreur état civil réelle
             destination_dir_final = dir_identity_error
             message = "🔴 (erreur état civil)"
             stats["identity_error"] += 1
@@ -487,16 +595,21 @@ def process_folder(source_dir: str, log_callback=None, destination_dir: str = No
         # Store details for report
         file_details.append({
             'filename': filename,
-            'p1_clean': res_p1, # True if "Non", False if homonym detected
+            'p1_clean': res_p1,
             'identities': identities,
             'is_manual': is_manual,
             'is_identity_error': is_identity_error,
+            'is_identity_space': is_identity_space,
             'identity_check': identity_check
         })
 
         try:
             shutil.move(filepath, os.path.join(destination_dir_final, filename))
-            log_callback(f"{message} {filename} → {os.path.basename(destination_dir_final)}/")
+            dest_label = os.path.basename(destination_dir_final)
+            # Ajouter le parent si c'est un sous-dossier
+            if destination_dir_final == dir_identity_space:
+                dest_label = 'Erreur_Etat_civil/Espaces_inseres'
+            log_callback(f"{message} {filename} → {dest_label}/")
         except Exception as e:
             log_callback(f"❌ Erreur déplacement {filename}: {e}")
 
@@ -510,6 +623,7 @@ def process_folder(source_dir: str, log_callback=None, destination_dir: str = No
     log_callback(f"   ✅ Pas d'homonyme     : {stats['ok']}")
     log_callback(f"   🔶 Homonymes détectés : {stats['manual']}")
     log_callback(f"   🔴 Erreur état civil  : {stats['identity_error']}")
+    log_callback(f"   🟣 Erreur espaces     : {stats['identity_error_space']}")
     log_callback(f"   ⚠️  Erreurs            : {stats['error']}")
     log_callback(f"{'='*50}")
     
