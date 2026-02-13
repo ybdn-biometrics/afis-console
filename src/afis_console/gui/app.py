@@ -12,9 +12,30 @@ class App(ctk.CTk):
     def __init__(self):
         super().__init__()
 
-        self.title("AFIS Console - Tri de Rapports FAED")
-        self.geometry("800x700")
-        
+        # --- Icon Setup ---
+        try:
+            # Resolve path relative to this file
+            base_dir = os.path.dirname(os.path.abspath(__file__))
+            icon_path = os.path.join(base_dir, "..", "assets", "app_icon.png")
+            
+            if os.path.exists(icon_path):
+                # Use PhotoImage for cross-platform png support (Linux/Mac/Windows)
+                self.icon_img = tk.PhotoImage(file=icon_path) # Keep reference
+                self.iconphoto(False, self.icon_img) 
+                
+                # Windows specific taskbar icon fix
+                if sys.platform.startswith('win'):
+                     try:
+                        import ctypes
+                        myappid = 'afis.console.sorter.v1' 
+                        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(myappid)
+                     except:
+                        pass
+            else:
+                print(f"Icon not found at {icon_path}")
+        except Exception as e:
+            print(f"Could not load icon: {e}")
+
         # Configure layout priority
         self.grid_columnconfigure(0, weight=1)
         self.grid_rowconfigure(1, weight=0) # Main Form
