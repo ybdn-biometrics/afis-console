@@ -2,93 +2,182 @@ name: Build & Release
 
 on:
   push:
-    tags:
-      - 'v*'
-  pull_request:
     branches: [ "main" ]
   workflow_dispatch:
 
+permissions:
+  contents: write
+
 jobs:
+  # ──────────────────────────────────────────────
+  # 1. Extract version & decide if tag already exists
+  # ──────────────────────────────────────────────
+  version:
+    name: Resolve version
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.get_version.outputs.version }}
+      tag: ${{ steps.get_version.outputs.tag }}
+      tag_exists: ${{ steps.check_tag.outputs.exists }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Extract version from __init__.py
+        id: get_version
+        run: |
+          VERSION=$(python -c "import re; print(re.search(r'__version__\s*=\s*\"(.+?)\"', open('src/afis_console/__init__.py').read()).group(1))")
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "tag=v$VERSION" >> "$GITHUB_OUTPUT"
+          echo "📦 Detected version: $VERSION (tag: v$VERSION)"
+
+      - name: Check if tag already exists
+        id: check_tag
+        run: |
+          if git rev-parse "v${{ steps.get_version.outputs.version }}" >/dev/null 2>&1; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+            echo "⚠️ Tag v${{ steps.get_version.outputs.version }} already exists"
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+            echo "✅ Tag v${{ steps.get_version.outputs.version }} is new"
+          fi
+
+  # ──────────────────────────────────────────────
+  # 2. Build the application on Ubuntu & Windows
+  # ──────────────────────────────────────────────
   build:
     name: Build on ${{ matrix.os }}
+    needs: version
+    if: needs.version.outputs.tag_exists == 'false'
     runs-on: ${{ matrix.os }}
     strategy:
+      fail-fast: false
       matrix:
         os: [ubuntu-latest, windows-latest]
 
     steps:
-    - uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-    - name: Set up Python
-      uses: actions/setup-python@v4
-      with:
-        python-version: '3.11'
-        cache: 'pip'
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
 
-    - name: Install Tkinter (Linux)
-      if: runner.os == 'Linux'
-      run: |
-        sudo apt-get update
-        sudo apt-get install -y python3-tk tk-dev
+      - name: Install Tkinter (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y python3-tk tk-dev
 
-    - name: Install dependencies
-      run: |
-        python -m pip install --upgrade pip
-        pip install -r requirements.txt
-        pip install pyinstaller
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install pyinstaller
 
-    - name: Build Application
-      run: python build_app.py
+      - name: Build Application (onefile)
+        run: python build_app.py
 
-    - name: Zip Build (Windows)
-      if: runner.os == 'Windows'
-      run: |
-        Compress-Archive -Path dist/TriRapportsFAED -DestinationPath TriRapportsFAED-Windows.zip
+      - name: List build output
+        run: ls -la dist/
+        shell: bash
 
-    - name: Zip Build (Linux)
-      if: runner.os == 'Linux'
-      run: |
-        cd dist
-        zip -r ../TriRapportsFAED-Linux.zip TriRapportsFAED
-        cd ..
+      - name: Upload Artifact (Windows)
+        if: runner.os == 'Windows'
+        uses: actions/upload-artifact@v4
+        with:
+          name: TriRapportsFAED-Windows
+          path: dist/TriRapportsFAED-Windows.exe
+          if-no-files-found: error
 
-    - name: Upload Artifact (Windows)
-      if: runner.os == 'Windows'
-      uses: actions/upload-artifact@v4
-      with:
-        name: TriRapportsFAED-Windows
-        path: TriRapportsFAED-Windows.zip
+      - name: Upload Artifact (Linux)
+        if: runner.os == 'Linux'
+        uses: actions/upload-artifact@v4
+        with:
+          name: TriRapportsFAED-Linux
+          path: dist/TriRapportsFAED-Linux
+          if-no-files-found: error
 
-    - name: Upload Artifact (Linux)
-      if: runner.os == 'Linux'
-      uses: actions/upload-artifact@v4
-      with:
-        name: TriRapportsFAED-Linux
-        path: TriRapportsFAED-Linux.zip
-
+  # ──────────────────────────────────────────────
+  # 3. Create GitHub Release with auto-generated notes
+  # ──────────────────────────────────────────────
   release:
-    name: Create Release
-    needs: build
-    if: startsWith(github.ref, 'refs/tags/')
+    name: Create Release ${{ needs.version.outputs.tag }}
+    needs: [version, build]
     runs-on: ubuntu-latest
-    permissions:
-      contents: write
     steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # Full history for changelog generation
+
       - name: Download Windows Artifact
         uses: actions/download-artifact@v4
         with:
           name: TriRapportsFAED-Windows
-          
+
       - name: Download Linux Artifact
         uses: actions/download-artifact@v4
         with:
           name: TriRapportsFAED-Linux
 
-      - name: Create Release
-        uses: softprops/action-gh-release@v1
+      - name: Make Linux binary executable
+        run: chmod +x TriRapportsFAED-Linux
+
+      - name: Generate Release Notes
+        id: release_notes
+        run: |
+          TAG="${{ needs.version.outputs.tag }}"
+          
+          # Get the previous tag (if any)
+          PREV_TAG=$(git describe --tags --abbrev=0 2>/dev/null || echo "")
+          
+          {
+            echo "notes<<RELEASE_NOTES_EOF"
+            echo "## 🚀 AFIS Console $TAG"
+            echo ""
+            echo "### 📥 Téléchargement"
+            echo ""
+            echo "| Plateforme | Fichier |"
+            echo "|---|---|"
+            echo "| 🪟 Windows | \`TriRapportsFAED-Windows.exe\` |"
+            echo "| 🐧 Ubuntu/Linux | \`TriRapportsFAED-Linux\` |"
+            echo ""
+            echo "### 📝 Changements"
+            echo ""
+            
+            if [ -n "$PREV_TAG" ]; then
+              git log "${PREV_TAG}..HEAD" --pretty=format:"- %s (%h)" --no-merges 2>/dev/null || echo "- Première release"
+            else
+              git log --pretty=format:"- %s (%h)" --no-merges -20 2>/dev/null || echo "- Première release"
+            fi
+            
+            echo ""
+            echo ""
+            echo "### ℹ️ Instructions"
+            echo ""
+            echo "**Windows** : Téléchargez \`TriRapportsFAED-Windows.exe\` et exécutez-le directement."
+            echo ""
+            echo "**Linux** : Téléchargez \`TriRapportsFAED-Linux\`, rendez-le exécutable avec \`chmod +x TriRapportsFAED-Linux\`, puis lancez-le."
+            echo "RELEASE_NOTES_EOF"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Create Git Tag
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git tag -a "${{ needs.version.outputs.tag }}" -m "Release ${{ needs.version.outputs.tag }}"
+          git push origin "${{ needs.version.outputs.tag }}"
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
         with:
+          tag_name: ${{ needs.version.outputs.tag }}
+          name: "AFIS Console ${{ needs.version.outputs.tag }}"
+          body: ${{ steps.release_notes.outputs.notes }}
+          draft: false
+          prerelease: false
           files: |
-            TriRapportsFAED-Windows.zip
-            TriRapportsFAED-Linux.zip
+            TriRapportsFAED-Windows.exe
+            TriRapportsFAED-Linux
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

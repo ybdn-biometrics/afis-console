@@ -50,8 +50,13 @@ python start_app.py /chemin/vers/dossier/pdfs
 
 ### Via GitHub Actions (Automatique)
 
-Chaque "push" sur la branche `main` déclenche une action GitHub qui compile l'application pour **Windows (.exe)** et **Linux**.
-Les exécutables sont téléchargeables depuis l'onglet "Actions" de GitHub (cliquez sur le dernier run, puis regardez dans "Artifacts").
+Chaque push sur la branche `main` déclenche automatiquement une GitHub Action qui :
+1. Lit la version depuis `src/afis_console/__init__.py`
+2. Compile l'application en **fichier unique** (PyInstaller `--onefile`) pour **Windows (.exe)** et **Linux**
+3. Crée une **Release GitHub** avec un tag `vX.Y.Z` et les exécutables en téléchargement
+
+Pour publier une nouvelle release, il suffit de **modifier la version** dans `src/afis_console/__init__.py` et de pusher sur `main`.
+Les releases sont disponibles sur la [page Releases](../../releases) du dépôt.
 
 ### Compilation Locale
 
