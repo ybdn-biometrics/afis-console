@@ -25,12 +25,14 @@ app_name = "TriRapportsFAED"
 args = [
     'src/afis_console/main.py',
     '--name', app_name,
-    '--onefile',
-    '--noconsole',
+    '--onedir',   # Changed from --onefile
+    '--windowed', # No console window (GUI app)
     f'--add-data={ctk_path}{sep}customtkinter',
+    f'--add-data=src/afis_console/assets{sep}afis_console/assets', # Include assets folder
     '--paths=src',
     '--clean',
     '--log-level=INFO',
+    '--icon=src/afis_console/assets/app_icon.png', # Add icon
 ]
 
 # Run PyInstaller

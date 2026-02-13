@@ -14,9 +14,23 @@ class App(ctk.CTk):
 
         # --- Icon Setup ---
         try:
-            # Resolve path relative to this file
-            base_dir = os.path.dirname(os.path.abspath(__file__))
-            icon_path = os.path.join(base_dir, "..", "assets", "app_icon.png")
+            if getattr(sys, 'frozen', False):
+                # If the application is run as a bundle, the PyInstaller bootloader
+                # extends the sys module by a flag frozen=True and sets the app 
+                # path into variable _MEIPASS'.
+                application_path = sys._MEIPASS
+            else:
+                application_path = os.path.dirname(os.path.abspath(__file__))
+
+            # Logic depends on where we put assets in build_app.py
+            # If we use --add-data "src/afis_console/assets:afis_console/assets"
+            # In dev: src/afis_console/gui/../assets -> src/afis_console/assets
+            # In frozen: _MEIPASS/afis_console/assets (if we map it there)
+            
+            if getattr(sys, 'frozen', False):
+                 icon_path = os.path.join(application_path, "afis_console", "assets", "app_icon.png")
+            else:
+                 icon_path = os.path.join(application_path, "..", "assets", "app_icon.png")
             
             if os.path.exists(icon_path):
                 # Use PhotoImage for cross-platform png support (Linux/Mac/Windows)
