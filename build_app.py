@@ -44,13 +44,13 @@ if os.path.exists(icon_source):
             # Create .ico with multiple sizes for best Windows rendering
             img.save(ico_path, format='ICO', sizes=[(256, 256), (128, 128), (64, 64), (48, 48), (32, 32), (16, 16)])
             icon_arg = f'--icon={ico_path}'
-            print(f"✅ Converted icon to .ico: {ico_path}")
+            print(f"[OK] Converted icon to .ico: {ico_path}")
         except Exception as e:
-            print(f"⚠️ Could not convert icon to .ico: {e}. Building without icon.")
+            print(f"[WARN] Could not convert icon to .ico: {e}. Building without icon.")
     else:
         icon_arg = f'--icon={icon_source}'
 else:
-    print(f"⚠️ Icon not found at {icon_source}. Building without icon.")
+    print(f"[WARN] Icon not found at {icon_source}. Building without icon.")
 
 # PyInstaller arguments
 args = [
@@ -74,7 +74,7 @@ if icon_arg:
 # Run PyInstaller
 try:
     PyInstaller.__main__.run(args)
-    print(f"\n✅ Build successful! Output: dist/{app_name_with_suffix}")
+    print(f"\n[OK] Build successful! Output: dist/{app_name_with_suffix}")
 except Exception as e:
     print(f"Build failed: {e}")
     sys.exit(1)
